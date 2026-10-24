@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"unicode/utf8"
 )
 
 func newTestClient(t *testing.T, h http.Handler, mutate ...func(*Config)) *Client {
@@ -218,5 +219,85 @@ func TestConnectionErrorDoesNotLeakKey(t *testing.T) {
 	_, _, err = c.GetJob(context.Background(), "j")
 	if err == nil || strings.Contains(err.Error(), "secret-token") {
 		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestAPIKeyIsTrimmed(t *testing.T) {
+	var got string
+	c := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = r.Header.Get("Authorization")
+		_, _ = w.Write([]byte(`{"id":"j1"}`))
+	}), func(cfg *Config) { cfg.APIKey = "  secret-token\r\n" })
+	if _, _, err := c.GetJob(context.Background(), "j1"); err != nil {
+		t.Fatalf("key with trailing newline should work: %v", err)
+	}
+	if got != "Bearer secret-token" {
+		t.Errorf("Authorization = %q", got)
+	}
+}
+
+func TestOversizeSuccessResponseIsExplicitError(t *testing.T) {
+	body := `{"messages":[{"id":"m1","content":"` + strings.Repeat("z", 5000) + `"}]}`
+	c := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(body))
+	}), func(cfg *Config) { cfg.MaxResponseBytes = 1000 })
+	_, err := c.ListMessages(context.Background(), "t1", "", 0)
+	var tooBig *ResponseTooLargeError
+	if !errors.As(err, &tooBig) || tooBig.Limit != 1000 {
+		t.Fatalf("err = %v", err)
+	}
+	if !strings.Contains(err.Error(), "response exceeds 1000 bytes; use a smaller limit") || strings.Contains(err.Error(), "decoding") {
+		t.Errorf("unclear error: %v", err)
+	}
+}
+
+func TestResponseExactlyAtLimitIsAccepted(t *testing.T) {
+	body := `{"id":"j1","kind":"custom"}`
+	c := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(body))
+	}), func(cfg *Config) { cfg.MaxResponseBytes = int64(len(body)) })
+	if _, _, err := c.GetJob(context.Background(), "j1"); err != nil {
+		t.Fatalf("response at the limit should be accepted: %v", err)
+	}
+}
+
+func TestOversizeErrorBodyStillAnAPIError(t *testing.T) {
+	c := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+		_, _ = w.Write([]byte(strings.Repeat("e", 5000)))
+	}), func(cfg *Config) { cfg.MaxResponseBytes = 1000 })
+	_, _, err := c.GetJob(context.Background(), "j1")
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) || apiErr.Status != http.StatusBadGateway || len(apiErr.Message) > 600 {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestErrorTextRedactsBeforeTruncatingOnRuneBoundary(t *testing.T) {
+	// The key straddles the 500-byte cut: truncating first would leave a
+	// recognizable prefix of it in the message.
+	key := "secret-token"
+	msg := strings.Repeat("a", 495) + key + strings.Repeat("b", 50)
+	c := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(msg))
+	}))
+	_, _, err := c.GetJob(context.Background(), "j1")
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatal(err)
+	}
+	if strings.Contains(apiErr.Message, "secret") || strings.Contains(apiErr.Message, "token") {
+		t.Errorf("message leaks part of the key: %q", apiErr.Message)
+	}
+
+	// Multi-byte characters are never split.
+	c2 := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(strings.Repeat("é", 400))) // 800 bytes
+	}))
+	_, _, err = c2.GetJob(context.Background(), "j1")
+	if !errors.As(err, &apiErr) || !utf8.ValidString(apiErr.Message) || !strings.HasSuffix(apiErr.Message, "...") {
+		t.Errorf("message = %q", apiErr.Message)
 	}
 }

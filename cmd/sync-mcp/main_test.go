@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -160,5 +161,97 @@ func TestStdioLoop(t *testing.T) {
 	}
 	if strings.Contains(stderr.String(), secret) {
 		t.Errorf("stderr leaks the API key: %s", stderr.String())
+	}
+}
+
+// toolNames starts the server with the given args and environment, performs
+// the MCP handshake over the stdio loop and returns the registered tool names.
+func toolNames(t *testing.T, args []string, env map[string]string) []string {
+	t.Helper()
+	inR, inW := io.Pipe()
+	outR, outW := io.Pipe()
+	done := make(chan error, 1)
+	go func() {
+		done <- run(args, envFrom(env), inR, outW, io.Discard)
+		_ = outW.Close()
+	}()
+	reader := bufio.NewReader(outR)
+	send := func(v any) {
+		b, _ := json.Marshal(v)
+		if _, err := inW.Write(append(b, '\n')); err != nil {
+			t.Fatal(err)
+		}
+	}
+	recv := func() map[string]any {
+		ch := make(chan map[string]any, 1)
+		go func() {
+			line, _ := reader.ReadBytes('\n')
+			var m map[string]any
+			_ = json.Unmarshal(line, &m)
+			ch <- m
+		}()
+		select {
+		case m := <-ch:
+			return m
+		case <-time.After(10 * time.Second):
+			t.Fatal("timed out waiting for response")
+			return nil
+		}
+	}
+	send(map[string]any{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": map[string]any{
+		"protocolVersion": "2025-06-18", "capabilities": map[string]any{},
+		"clientInfo": map[string]any{"name": "test", "version": "0"},
+	}})
+	recv()
+	send(map[string]any{"jsonrpc": "2.0", "method": "notifications/initialized"})
+	send(map[string]any{"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
+	var names []string
+	res, _ := recv()["result"].(map[string]any)
+	for _, tl := range res["tools"].([]any) {
+		names = append(names, tl.(map[string]any)["name"].(string))
+	}
+	_ = inW.Close()
+	<-done
+	sort.Strings(names)
+	return names
+}
+
+func baseEnv() map[string]string {
+	return map[string]string{"SYNC_BASE_URL": "http://localhost:1", "SYNC_API_KEY": "k\n", "SYNC_ORG": "org1", "SYNC_PROJECT": "proj1"}
+}
+
+func TestReadOnlyFlagAndEnv(t *testing.T) {
+	want := []string{"sync_health", "sync_job_get", "sync_message_list", "sync_session_read"}
+
+	if got := toolNames(t, []string{"--read-only"}, baseEnv()); strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Errorf("--read-only tools = %v, want %v", got, want)
+	}
+	env := baseEnv()
+	env["SYNC_READ_ONLY"] = "true"
+	if got := toolNames(t, nil, env); strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Errorf("SYNC_READ_ONLY=true tools = %v, want %v", got, want)
+	}
+	// The flag overrides the environment.
+	if got := toolNames(t, []string{"--read-only=false"}, env); len(got) != 8 {
+		t.Errorf("--read-only=false should register all 8 tools, got %v", got)
+	}
+	if got := toolNames(t, nil, baseEnv()); len(got) != 8 {
+		t.Errorf("default should register all 8 tools, got %v", got)
+	}
+}
+
+func TestInvalidReadOnlyEnv(t *testing.T) {
+	env := baseEnv()
+	env["SYNC_READ_ONLY"] = "maybe"
+	err := run(nil, envFrom(env), strings.NewReader(""), io.Discard, io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "SYNC_READ_ONLY") {
+		t.Errorf("err = %v", err)
+	}
+}
+
+func TestAPIKeyWithNewlineAccepted(t *testing.T) {
+	// baseEnv's key is "k\n"; the server must start (key trimmed, not rejected).
+	if got := toolNames(t, nil, baseEnv()); len(got) != 8 {
+		t.Errorf("tools = %v", got)
 	}
 }

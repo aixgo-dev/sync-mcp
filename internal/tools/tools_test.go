@@ -238,16 +238,26 @@ type harness struct {
 
 func newHarness(t *testing.T, token string) *harness {
 	t.Helper()
+	return newHarnessWith(t, token, nil)
+}
+
+// newHarnessWith is newHarness with a client config tweak and register options.
+func newHarnessWith(t *testing.T, token string, mutate func(*syncclient.Config), opts ...tools.Option) *harness {
+	t.Helper()
 	fake := newFake()
 	srv := httptest.NewServer(fake)
 	t.Cleanup(srv.Close)
 
-	client, err := syncclient.New(syncclient.Config{BaseURL: srv.URL, APIKey: token, Org: testOrg, Project: testProject})
+	cfg := syncclient.Config{BaseURL: srv.URL, APIKey: token, Org: testOrg, Project: testProject}
+	if mutate != nil {
+		mutate(&cfg)
+	}
+	client, err := syncclient.New(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
 	server := mcp.NewServer(&mcp.Implementation{Name: "sync-mcp", Version: "test"}, nil)
-	tools.Register(server, client)
+	tools.Register(server, client, opts...)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
@@ -447,17 +457,16 @@ func TestMessageAppendAndList(t *testing.T) {
 			"thread_id": "t1", "role": "agent", "content": fmt.Sprintf("hello %d", i),
 			"sender_actor_id": "actor-1", "refs": map[string]any{"n": i},
 		})
-		msg := sub(t, out, "message")
-		if msg["id"] == "" || msg["created_at"] == "" || out["etag"] == "" {
+		if out["id"] == "" || out["thread_id"] != "t1" || out["created_at"] == "" || out["etag"] == "" {
 			t.Fatalf("incomplete result %v", out)
 		}
-		ids = append(ids, msg["id"].(string))
+		ids = append(ids, out["id"].(string))
 	}
 	h.ok(t, tools.ToolMessageAppend, map[string]any{"thread_id": "other", "role": "user", "content": "elsewhere"})
 
 	list := h.ok(t, tools.ToolMessageList, map[string]any{"thread_id": "t1"})
 	msgs := list["messages"].([]any)
-	if len(msgs) != 3 || list["count"].(float64) != 3 || list["last_id"] != ids[2] {
+	if len(msgs) != 3 || list["count"].(float64) != 3 || list["last_id"] != ids[2] || list["has_more"] != false || list["truncated"] != false {
 		t.Fatalf("unexpected list %v", list)
 	}
 	if msgs[0].(map[string]any)["content"] != "hello 0" {
@@ -483,7 +492,7 @@ func TestMessageValidation(t *testing.T) {
 	h.fail(t, tools.ToolMessageAppend, map[string]any{"thread_id": "a/b", "role": "user", "content": "x"}, "thread_id")
 	h.fail(t, tools.ToolMessageList, map[string]any{"thread_id": ""}, "thread_id")
 	h.fail(t, tools.ToolMessageList, map[string]any{"thread_id": "t", "limit": 5000}, "limit")
-	h.fail(t, tools.ToolMessageList, map[string]any{"thread_id": "t", "limit": -1}, "limit")
+	h.fail(t, tools.ToolMessageList, map[string]any{"thread_id": "t", "limit": -1}, "limit", "between 1 and 1000")
 }
 
 func TestJobLifecycle(t *testing.T) {

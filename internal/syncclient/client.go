@@ -18,15 +18,30 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 const (
 	// DefaultTimeout is the per-request timeout used when none is configured.
 	DefaultTimeout = 15 * time.Second
 
-	// maxResponseBytes caps how much of a response body is read.
-	maxResponseBytes = 8 << 20
+	// DefaultMaxResponseBytes caps how much of a response body is read. A
+	// larger successful response is reported as an error, never truncated.
+	DefaultMaxResponseBytes = 8 << 20
+
+	// maxErrorMessageBytes caps the upstream error text included in errors.
+	maxErrorMessageBytes = 500
 )
+
+// ResponseTooLargeError is returned when a successful response is bigger
+// than the client's response size limit.
+type ResponseTooLargeError struct {
+	Limit int64
+}
+
+func (e *ResponseTooLargeError) Error() string {
+	return fmt.Sprintf("response exceeds %d bytes; use a smaller limit", e.Limit)
+}
 
 // Config configures a Client.
 type Config struct {
@@ -40,6 +55,9 @@ type Config struct {
 	Project string
 	// Timeout is the per-request timeout. Zero means DefaultTimeout.
 	Timeout time.Duration
+	// MaxResponseBytes is the largest successful response body accepted.
+	// Zero means DefaultMaxResponseBytes.
+	MaxResponseBytes int64
 	// HTTPClient overrides the underlying HTTP client (used in tests).
 	HTTPClient *http.Client
 }
@@ -51,6 +69,7 @@ type Client struct {
 	org     string
 	project string
 	http    *http.Client
+	maxResp int64
 }
 
 // APIError is returned when Sync answers with a non-2xx status.
@@ -75,7 +94,10 @@ func New(cfg Config) (*Client, error) {
 	if err := ValidateID("project", cfg.Project); err != nil {
 		return nil, err
 	}
-	if strings.TrimSpace(cfg.APIKey) == "" {
+	// Keys pasted from files or secret stores often carry a trailing newline,
+	// which is not a valid header value and never part of the key.
+	apiKey := strings.TrimSpace(cfg.APIKey)
+	if apiKey == "" {
 		return nil, errors.New("api key must not be empty")
 	}
 	u, err := url.Parse(strings.TrimSpace(cfg.BaseURL))
@@ -100,9 +122,15 @@ func New(cfg Config) (*Client, error) {
 	hcCopy := *hc
 	hcCopy.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 
+	maxResp := cfg.MaxResponseBytes
+	if maxResp <= 0 {
+		maxResp = DefaultMaxResponseBytes
+	}
+
 	return &Client{
+		maxResp: maxResp,
 		base:    u,
-		apiKey:  cfg.APIKey,
+		apiKey:  apiKey,
 		org:     cfg.Org,
 		project: cfg.Project,
 		http:    &hcCopy,
@@ -347,13 +375,19 @@ func (c *Client) do(ctx context.Context, method, path string, body any, hdr http
 	}
 	defer resp.Body.Close()
 
-	data, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
+	// Read one byte past the limit so an oversized body is detected instead
+	// of being silently cut off (which would corrupt the JSON).
+	data, err := io.ReadAll(io.LimitReader(resp.Body, c.maxResp+1))
 	if err != nil {
 		return "", c.sanitize(fmt.Errorf("reading sync response: %w", err))
 	}
 
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		// Error bodies are only quoted, so truncation is harmless here.
 		return "", &APIError{Status: resp.StatusCode, Message: c.errorMessage(data)}
+	}
+	if int64(len(data)) > c.maxResp {
+		return "", &ResponseTooLargeError{Limit: c.maxResp}
 	}
 
 	etag := strings.Trim(resp.Header.Get("ETag"), `"`)
@@ -379,10 +413,23 @@ func (c *Client) errorMessage(data []byte) string {
 	if json.Unmarshal(data, &j) == nil && j.Error != "" {
 		msg = j.Error
 	}
-	if len(msg) > 500 {
-		msg = msg[:500] + "..."
+	// Redact first: truncating first could cut a key in half and leave a
+	// recognizable prefix behind.
+	msg = strings.ReplaceAll(msg, c.apiKey, "[redacted]")
+	return truncateRunes(msg, maxErrorMessageBytes)
+}
+
+// truncateRunes shortens s to at most max bytes without splitting a UTF-8
+// character, appending "..." when it cut anything.
+func truncateRunes(s string, max int) string {
+	if len(s) <= max {
+		return s
 	}
-	return strings.ReplaceAll(msg, c.apiKey, "[redacted]")
+	cut := max
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return strings.ToValidUTF8(s[:cut], "") + "..."
 }
 
 // sanitize makes sure an error can never reveal the API key.
