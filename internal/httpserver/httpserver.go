@@ -31,8 +31,8 @@ const (
 	HealthPath = "/healthz"
 
 	// MinTokenLength is the shortest bearer token accepted. A random token of
-	// this length or more cannot be guessed over the network.
-	MinTokenLength = 16
+	// this length (128 bits as hex) cannot be guessed over the network.
+	MinTokenLength = 32
 
 	// MaxBodyBytes is the largest request body accepted. A 256 KiB tool input
 	// can grow several times when a client escapes every character, so this

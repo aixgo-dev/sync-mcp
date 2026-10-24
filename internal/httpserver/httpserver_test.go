@@ -78,8 +78,9 @@ func TestValidate(t *testing.T) {
 	}{
 		{"no token", httpserver.Config{Addr: "127.0.0.1:8081"}, "requires a bearer token"},
 		{"blank token", httpserver.Config{Addr: "127.0.0.1:8081", AuthToken: "   "}, "requires a bearer token"},
-		{"short token", httpserver.Config{Addr: "127.0.0.1:8081", AuthToken: "short"}, "at least 16"},
-		{"token with space", httpserver.Config{Addr: "127.0.0.1:8081", AuthToken: "aaaaaaaa bbbbbbbbbbbb"}, "printable ASCII"},
+		{"short token", httpserver.Config{Addr: "127.0.0.1:8081", AuthToken: "short"}, "at least 32"},
+		{"token with space", httpserver.Config{Addr: "127.0.0.1:8081", AuthToken: "aaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbbbbbb"}, "printable ASCII"},
+		{"31 chars", httpserver.Config{Addr: "127.0.0.1:8081", AuthToken: goodToken[:31]}, "at least 32"},
 		{"good token loopback", httpserver.Config{Addr: "127.0.0.1:8081", AuthToken: goodToken}, ""},
 		{"good token all interfaces", httpserver.Config{Addr: ":8081", AuthToken: goodToken}, ""},
 		{"insecure loopback v4", httpserver.Config{Addr: "127.0.0.1:8081", InsecureNoAuth: true}, ""},

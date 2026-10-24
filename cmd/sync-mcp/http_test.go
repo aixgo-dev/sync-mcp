@@ -21,7 +21,7 @@ import (
 
 const (
 	httpToken = "0123456789abcdef0123456789abcdef"
-	syncKey   = "sync-api-key-for-tests"
+	syncKey   = "sync-api-key-for-tests-0123456789abcdef"
 )
 
 func httpEnv(sync string, extra map[string]string) func(string) string {
@@ -55,7 +55,7 @@ func TestHTTPTokenValidation(t *testing.T) {
 		env  map[string]string
 		want string
 	}{
-		{"short token", nil, map[string]string{"SYNC_MCP_AUTH_TOKEN": "tooshort"}, "at least 16"},
+		{"short token", nil, map[string]string{"SYNC_MCP_AUTH_TOKEN": "tooshort"}, "at least 32"},
 		{"same as sync key", nil, map[string]string{"SYNC_MCP_AUTH_TOKEN": syncKey}, "must differ"},
 		{"insecure on all interfaces", []string{"--insecure-no-auth", "--listen", ":8081"}, nil, "loopback"},
 		{"insecure on 0.0.0.0 via env", []string{"--insecure-no-auth"}, map[string]string{"SYNC_MCP_LISTEN": "0.0.0.0:8081"}, "loopback"},
@@ -358,5 +358,32 @@ func TestHTTPTransportAgainstRealSync(t *testing.T) {
 	id := job["job"].(map[string]any)["id"].(string)
 	if call("sync_job_claim", map[string]any{"job_id": id, "worker_id": "w1"})["job"].(map[string]any)["status"] != "claimed" {
 		t.Error("job not claimed")
+	}
+}
+
+// Flag defaults are printed in usage output, so secrets must never be flag
+// defaults: -h and mistyped flags must not echo them.
+func TestUsageDoesNotEchoSecrets(t *testing.T) {
+	for _, args := range [][]string{{"-h"}, {"--no-such-flag"}} {
+		err, stderr := runErr(args, httpEnv("http://127.0.0.1:1", map[string]string{"SYNC_MCP_AUTH_TOKEN": httpToken}))
+		if err == nil {
+			t.Fatalf("%v: expected an error", args)
+		}
+		for _, secret := range []string{syncKey, httpToken} {
+			if strings.Contains(stderr, secret) || strings.Contains(err.Error(), secret) {
+				t.Errorf("%v: usage output leaks a secret:\n%s", args, stderr)
+			}
+		}
+		if !strings.Contains(stderr, "SYNC_MCP_AUTH_TOKEN") {
+			t.Errorf("%v: usage should still document the variable", args)
+		}
+	}
+}
+
+// A flag overrides the environment variable, for both secrets.
+func TestFlagsOverrideSecretEnv(t *testing.T) {
+	err, _ := runErr([]string{"--auth-token", "short"}, httpEnv("http://127.0.0.1:1", map[string]string{"SYNC_MCP_AUTH_TOKEN": httpToken}))
+	if err == nil || !strings.Contains(err.Error(), "at least 32") {
+		t.Fatalf("the flag should override the environment: %v", err)
 	}
 }

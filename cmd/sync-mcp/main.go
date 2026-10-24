@@ -76,7 +76,10 @@ func runContext(ctx context.Context, args []string, getenv func(string) string, 
 	fs := flag.NewFlagSet("sync-mcp", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	baseURL := fs.String("base-url", getenv("SYNC_BASE_URL"), "Sync server base URL (env SYNC_BASE_URL)")
-	apiKey := fs.String("api-key", getenv("SYNC_API_KEY"), "Sync API key (env SYNC_API_KEY; prefer the environment variable, flags are visible in process listings)")
+	// Secrets get an empty flag default and are read from the environment after
+	// parsing: the flag package prints defaults in its usage output, which would
+	// otherwise echo the secret to stderr on -h or a mistyped flag.
+	apiKey := fs.String("api-key", "", "Sync API key (env SYNC_API_KEY; prefer the environment variable, flags are visible in process listings)")
 	org := fs.String("org", getenv("SYNC_ORG"), "organization ID every request is scoped to (env SYNC_ORG)")
 	project := fs.String("project", getenv("SYNC_PROJECT"), "project ID every request is scoped to (env SYNC_PROJECT)")
 	timeout := fs.Duration("timeout", syncclient.DefaultTimeout, "per-request timeout for calls to Sync")
@@ -92,7 +95,7 @@ func runContext(ctx context.Context, args []string, getenv func(string) string, 
 	actorID := fs.String("actor-id", getenv("SYNC_ACTOR_ID"), "pin the sender_actor_id of every appended message to this id; a model-supplied value is ignored (env SYNC_ACTOR_ID)")
 	transportName := fs.String("transport", orDefault(getenv("SYNC_MCP_TRANSPORT"), "stdio"), "MCP transport: stdio or http (env SYNC_MCP_TRANSPORT)")
 	listen := fs.String("listen", orDefault(getenv("SYNC_MCP_LISTEN"), defaultListen), "listen address for the http transport (env SYNC_MCP_LISTEN)")
-	authToken := fs.String("auth-token", getenv("SYNC_MCP_AUTH_TOKEN"), "bearer token clients must send to the http transport (env SYNC_MCP_AUTH_TOKEN; prefer the environment variable, flags are visible in process listings)")
+	authToken := fs.String("auth-token", "", "bearer token clients must send to the http transport (env SYNC_MCP_AUTH_TOKEN; prefer the environment variable, flags are visible in process listings)")
 	insecureNoAuth := fs.Bool("insecure-no-auth", false, "run the http transport without authentication; only allowed on a loopback --listen address, for local development")
 	allowedHosts := &stringList{vals: splitList(getenv("SYNC_MCP_ALLOWED_HOSTS"))}
 	fs.Var(allowedHosts, "allowed-host", "host name allowed in the Host header of http requests; repeatable or comma-separated (env SYNC_MCP_ALLOWED_HOSTS)")
@@ -105,6 +108,12 @@ func runContext(ctx context.Context, args []string, getenv func(string) string, 
 	if *showVersion {
 		fmt.Fprintln(stdout, version)
 		return nil
+	}
+	if strings.TrimSpace(*apiKey) == "" {
+		*apiKey = getenv("SYNC_API_KEY")
+	}
+	if strings.TrimSpace(*authToken) == "" {
+		*authToken = getenv("SYNC_MCP_AUTH_TOKEN")
 	}
 
 	var missing []string
@@ -211,6 +220,14 @@ func serveHTTP(ctx context.Context, server *mcp.Server, cfg httpserver.Config, l
 	ln, err := net.Listen("tcp", cfg.Addr)
 	if err != nil {
 		return err
+	}
+	if cfg.InsecureNoAuth {
+		// Defense in depth: a host name such as localhost is checked by
+		// name in Validate; make sure the socket really is loopback-only.
+		if ta, ok := ln.Addr().(*net.TCPAddr); !ok || !ta.IP.IsLoopback() {
+			_ = ln.Close()
+			return fmt.Errorf("--insecure-no-auth: %s is not bound to a loopback address", ln.Addr())
+		}
 	}
 	logger.Printf("serving %s on http://%s%s", desc, ln.Addr(), httpserver.MCPPath)
 	switch {
