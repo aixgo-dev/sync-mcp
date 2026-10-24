@@ -492,7 +492,7 @@ func TestMessageValidation(t *testing.T) {
 	h.fail(t, tools.ToolMessageAppend, map[string]any{"thread_id": "a/b", "role": "user", "content": "x"}, "thread_id")
 	h.fail(t, tools.ToolMessageList, map[string]any{"thread_id": ""}, "thread_id")
 	h.fail(t, tools.ToolMessageList, map[string]any{"thread_id": "t", "limit": 5000}, "limit")
-	h.fail(t, tools.ToolMessageList, map[string]any{"thread_id": "t", "limit": -1}, "limit", "between 1 and 1000")
+	h.fail(t, tools.ToolMessageList, map[string]any{"thread_id": "t", "limit": -1}, "limit")
 }
 
 func TestJobLifecycle(t *testing.T) {

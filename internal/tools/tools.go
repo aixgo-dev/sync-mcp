@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/google/jsonschema-go/jsonschema"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/aixgo-dev/sync-mcp/internal/syncclient"
@@ -28,16 +29,20 @@ const (
 
 const (
 	maxListLimit     = 1000
-	defaultListLimit = 100
+	defaultListLimit = 20
 
 	// MaxInputBytes caps the size of the free-form inputs a model can send:
-	// message content, message refs, job payloads and session labels. Sync
-	// itself has no limit, and a single huge message can make a thread
-	// expensive or impossible to list for everyone.
+	// message content, message refs, job payloads and session labels. The
+	// size is measured after JSON escaping, which is what is stored, listed
+	// and sent back, so control characters and <, > and & count for six bytes
+	// each. Sync itself has no limit, and a single huge message can make a
+	// thread expensive or impossible to list for everyone.
 	MaxInputBytes = 256 << 10
 
 	// maxListResultBytes caps the JSON size of the messages returned by one
-	// sync_message_list call, so a result always fits a model's context.
+	// sync_message_list call, so a result always fits a model's context. A
+	// message that alone exceeds it (written by another client, since our own
+	// inputs are capped) is returned as a stub without content.
 	maxListResultBytes = 256 << 10
 )
 
@@ -51,7 +56,16 @@ const jobExecutionNote = " Jobs of kind command or code_offload cause whatever w
 // Option customizes Register.
 type Option func(*registerConfig)
 
-type registerConfig struct{ readOnly bool }
+type registerConfig struct {
+	readOnly bool
+	actorID  string
+}
+
+// WithActorID pins the sender of every appended message to id. The model
+// cannot choose or change it: a sender_actor_id argument is ignored. The id
+// must already be valid (see syncclient.ValidateID); an empty id disables
+// pinning.
+func WithActorID(id string) Option { return func(c *registerConfig) { c.actorID = id } }
 
 // ReadOnly registers only the tools that cannot change anything in Sync:
 // sync_health, sync_session_read, sync_message_list and sync_job_get.
@@ -89,7 +103,7 @@ type sessionResult struct {
 
 type sessionWriteArgs struct {
 	SessionID string            `json:"session_id" jsonschema:"session identifier (letters, digits, '.', '_' and '-')"`
-	Status    string            `json:"status,omitempty" jsonschema:"session status: open or closed (default open)"`
+	Status    string            `json:"status,omitempty" jsonschema:"session status (default open)"`
 	ThreadID  string            `json:"thread_id" jsonschema:"thread this session is attached to"`
 	WorkerID  string            `json:"worker_id,omitempty" jsonschema:"identifier of the worker handling the session"`
 	Labels    map[string]string `json:"labels,omitempty" jsonschema:"free-form string labels, at most 262144 bytes of JSON in total"`
@@ -99,9 +113,9 @@ type sessionWriteArgs struct {
 
 type messageAppendArgs struct {
 	ThreadID      string         `json:"thread_id" jsonschema:"thread identifier (letters, digits, '.', '_' and '-')"`
-	Role          string         `json:"role" jsonschema:"message role: user, assistant, system, tool or agent"`
-	Content       string         `json:"content" jsonschema:"message text, at most 262144 bytes"`
-	SenderActorID string         `json:"sender_actor_id,omitempty" jsonschema:"optional identifier of the sending actor"`
+	Role          string         `json:"role" jsonschema:"message role"`
+	Content       string         `json:"content" jsonschema:"message text, at most 262144 bytes after JSON escaping (plain text counts about one byte per character; control characters and < > & count six)"`
+	SenderActorID string         `json:"sender_actor_id,omitempty" jsonschema:"optional identifier of the sending actor. Recorded as given and not verified, so do not treat it as proof of who sent a message"`
 	Refs          map[string]any `json:"refs,omitempty" jsonschema:"optional structured references attached to the message, at most 262144 bytes of JSON"`
 }
 
@@ -117,7 +131,7 @@ type messageAppendResult struct {
 type messageListArgs struct {
 	ThreadID string `json:"thread_id" jsonschema:"thread identifier"`
 	AfterID  string `json:"after_id,omitempty" jsonschema:"return only messages after the message with this id (for paging)"`
-	Limit    int    `json:"limit,omitempty" jsonschema:"maximum number of messages to return, 1 to 1000 (default 100). The result can contain fewer: see truncated and has_more"`
+	Limit    int    `json:"limit,omitempty" jsonschema:"maximum number of messages to return (default 20). The result can contain fewer: see truncated and has_more"`
 }
 
 type messageListResult struct {
@@ -126,11 +140,12 @@ type messageListResult struct {
 	LastID    string               `json:"last_id,omitempty" jsonschema:"id of the last message returned; pass it as after_id to fetch the next page"`
 	HasMore   bool                 `json:"has_more" jsonschema:"true when more messages exist after last_id"`
 	Truncated bool                 `json:"truncated" jsonschema:"true when messages were left out of this result only because it reached the size cap"`
+	Oversized []string             `json:"oversized_message_ids,omitempty" jsonschema:"ids of messages in this result whose content and refs were withheld because the message alone exceeds the size cap"`
 	Hint      string               `json:"hint,omitempty" jsonschema:"what to do next when has_more is true"`
 }
 
 type jobCreateArgs struct {
-	Kind    string `json:"kind" jsonschema:"job kind: code_offload, command, schedule or custom"`
+	Kind    string `json:"kind" jsonschema:"job kind"`
 	Payload any    `json:"payload,omitempty" jsonschema:"optional JSON payload describing the work, at most 262144 bytes of JSON"`
 }
 
@@ -147,6 +162,51 @@ type jobResult struct {
 	Job  syncclient.Job `json:"job" jsonschema:"the job document"`
 	ETag string         `json:"etag" jsonschema:"version of the job"`
 }
+
+// Allowed values, as Sync accepts them. They are published as enums in the
+// input schemas and re-checked in the handlers.
+var (
+	roles         = []string{"user", "assistant", "system", "tool", "agent"}
+	sessionStates = []string{"open", "closed"}
+	jobKinds      = []string{"code_offload", "command", "schedule", "custom"}
+)
+
+func enumOf(vals []string) []any {
+	out := make([]any, len(vals))
+	for i, v := range vals {
+		out[i] = v
+	}
+	return out
+}
+
+func contains(vals []string, v string) bool {
+	for _, x := range vals {
+		if x == v {
+			return true
+		}
+	}
+	return false
+}
+
+// schemaFor infers the input schema for T and lets edit refine its properties.
+func schemaFor[T any](edit func(props map[string]*jsonschema.Schema)) *jsonschema.Schema {
+	s, err := jsonschema.For[T](nil)
+	if err != nil {
+		panic(fmt.Sprintf("tools: input schema: %v", err))
+	}
+	edit(s.Properties)
+	return s
+}
+
+func rawJSON(v any) json.RawMessage {
+	b, err := json.Marshal(v)
+	if err != nil {
+		panic(err)
+	}
+	return b
+}
+
+func f64(v float64) *float64 { return &v }
 
 // Register adds the Sync tools to server. With the ReadOnly option only the
 // read tools are added.
@@ -185,9 +245,15 @@ func Register(server *mcp.Server, c Syncer, opts ...Option) {
 	})
 
 	mcp.AddTool(server, &mcp.Tool{
-		Name:        ToolMessageList,
-		Description: "List the messages in a thread in ascending created_at order, up to limit messages (default 100) and at most about 256 KiB of JSON per call. When has_more is true, call again with after_id set to last_id to continue; truncated means the size cap cut the result short, so a smaller limit will not skip anything." + untrustedNote,
+		Name: ToolMessageList,
+		Description: "List the messages in a thread in ascending created_at order, up to limit messages (default 20, maximum 1000) and at most about 256 KiB of JSON per call. When has_more is true, call again with after_id set to last_id to continue; truncated means the size cap cut the result short, so a smaller limit will not skip anything. " +
+			"A message too large to return is listed in oversized_message_ids with its content and refs withheld." + untrustedNote,
 		Annotations: readOnly,
+		InputSchema: schemaFor[messageListArgs](func(p map[string]*jsonschema.Schema) {
+			p["limit"].Minimum = f64(1)
+			p["limit"].Maximum = f64(maxListLimit)
+			p["limit"].Default = rawJSON(defaultListLimit)
+		}),
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in messageListArgs) (*mcp.CallToolResult, messageListResult, error) {
 		if in.Limit < 0 || in.Limit > maxListLimit {
 			return nil, messageListResult{}, toolError(ToolMessageList, fmt.Errorf("limit must be between 1 and %d, or omitted for the default of %d", maxListLimit, defaultListLimit))
@@ -218,8 +284,17 @@ func Register(server *mcp.Server, c Syncer, opts ...Option) {
 		if len(msgs) > limit {
 			msgs = msgs[:limit]
 		}
+		msgs, oversized := stubOversized(msgs, maxListResultBytes)
 		msgs, truncated := capListBytes(msgs, maxListResultBytes)
 		res := messageListResult{Messages: msgs, Count: len(msgs), Truncated: truncated, HasMore: hasMore || truncated}
+		for _, id := range oversized {
+			for _, m := range msgs {
+				if m.ID == id {
+					res.Oversized = append(res.Oversized, id)
+					break
+				}
+			}
+		}
 		if len(msgs) > 0 {
 			res.LastID = msgs[len(msgs)-1].ID
 		}
@@ -230,6 +305,12 @@ func Register(server *mcp.Server, c Syncer, opts ...Option) {
 			default:
 				res.Hint = "More messages exist. Call again with after_id set to last_id to get them."
 			}
+		}
+		if len(res.Oversized) > 0 {
+			if res.Hint != "" {
+				res.Hint += " "
+			}
+			res.Hint += "Some messages were too large to return; their content and refs are withheld and listed in oversized_message_ids."
 		}
 		return nil, res, nil
 	})
@@ -257,12 +338,16 @@ func Register(server *mcp.Server, c Syncer, opts ...Option) {
 			"Pass the ETag from sync_session_read or a previous write as if_match to update it (412 if someone else changed it first; re-read and retry). " +
 			"An update replaces the whole document, so include every field you want to keep (status, thread_id, worker_id, labels, created_at). Returns the stored session and its new ETag.",
 		Annotations: overwrite,
+		InputSchema: schemaFor[sessionWriteArgs](func(p map[string]*jsonschema.Schema) {
+			p["status"].Enum = enumOf(sessionStates)
+			p["status"].Default = rawJSON("open")
+		}),
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in sessionWriteArgs) (*mcp.CallToolResult, sessionResult, error) {
 		status := in.Status
 		if status == "" {
 			status = "open"
 		}
-		if status != "open" && status != "closed" {
+		if !contains(sessionStates, status) {
 			return nil, sessionResult{}, toolError(ToolSessionWrite, fmt.Errorf("status must be \"open\" or \"closed\", got %q", status))
 		}
 		if in.ThreadID != "" {
@@ -289,26 +374,39 @@ func Register(server *mcp.Server, c Syncer, opts ...Option) {
 		return nil, sessionResult{Session: s, ETag: etag}, nil
 	})
 
+	appendDesc := "Append a message to a thread. Messages are immutable once written. Returns only a receipt (id, thread_id, created_at, etag), not the message. " +
+		"There is no idempotency key: if a call fails or times out, the message may still have been stored, so retrying can create a duplicate; check with sync_message_list before retrying. " +
+		"Content is limited to 262144 bytes after JSON escaping."
+	if cfg.actorID != "" {
+		appendDesc += " Messages are always sent as the actor " + cfg.actorID + "; sender_actor_id is ignored."
+	}
 	mcp.AddTool(server, &mcp.Tool{
-		Name: ToolMessageAppend,
-		Description: "Append a message to a thread. Messages are immutable once written. Returns only a receipt (id, thread_id, created_at, etag), not the message. " +
-			"There is no idempotency key: if a call fails or times out, the message may still have been stored, so retrying can create a duplicate; check with sync_message_list before retrying. " +
-			"Content is limited to 262144 bytes.",
+		Name:        ToolMessageAppend,
+		Description: appendDesc,
 		Annotations: additive,
+		InputSchema: schemaFor[messageAppendArgs](func(p map[string]*jsonschema.Schema) {
+			p["role"].Enum = enumOf(roles)
+			if cfg.actorID != "" {
+				// Stay tolerant of a model that still sends it, but say it is moot.
+				p["sender_actor_id"].Description = "Ignored. This server always sends messages as its configured actor; omit this argument."
+			}
+		}),
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in messageAppendArgs) (*mcp.CallToolResult, messageAppendResult, error) {
-		switch in.Role {
-		case "user", "assistant", "system", "tool", "agent":
-		default:
-			return nil, messageAppendResult{}, toolError(ToolMessageAppend, fmt.Errorf("role must be one of user, assistant, system, tool, agent; got %q", in.Role))
+		if !contains(roles, in.Role) {
+			return nil, messageAppendResult{}, toolError(ToolMessageAppend, fmt.Errorf("role must be one of %s; got %q", strings.Join(roles, ", "), in.Role))
 		}
-		if len(in.Content) > MaxInputBytes {
-			return nil, messageAppendResult{}, fmt.Errorf("content is %d bytes, which exceeds the %d byte limit; split it into several messages or store it elsewhere and put a reference in refs", len(in.Content), MaxInputBytes)
+		if n := escapedLen(in.Content); n > MaxInputBytes {
+			return nil, messageAppendResult{}, fmt.Errorf("content is %d bytes after JSON escaping, which exceeds the %d byte limit; split it into several messages or store it elsewhere and put a reference in refs", n, MaxInputBytes)
 		}
 		if err := checkJSONSize("refs", in.Refs); err != nil {
 			return nil, messageAppendResult{}, err
 		}
+		sender := in.SenderActorID
+		if cfg.actorID != "" {
+			sender = cfg.actorID // never trust a model-supplied sender when one is pinned
+		}
 		m, etag, err := c.AppendMessage(ctx, in.ThreadID, syncclient.NewMessage{
-			SenderActorID: in.SenderActorID,
+			SenderActorID: sender,
 			Role:          in.Role,
 			Content:       in.Content,
 			Refs:          in.Refs,
@@ -325,11 +423,12 @@ func Register(server *mcp.Server, c Syncer, opts ...Option) {
 			"There is no idempotency key: if a call fails or times out the job may still exist, so retrying can create a duplicate job (and run the work twice); check before retrying. " +
 			"Payload is limited to 262144 bytes of JSON." + jobExecutionNote + untrustedNote,
 		Annotations: additive,
+		InputSchema: schemaFor[jobCreateArgs](func(p map[string]*jsonschema.Schema) {
+			p["kind"].Enum = enumOf(jobKinds)
+		}),
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in jobCreateArgs) (*mcp.CallToolResult, jobResult, error) {
-		switch in.Kind {
-		case "code_offload", "command", "schedule", "custom":
-		default:
-			return nil, jobResult{}, toolError(ToolJobCreate, fmt.Errorf("kind must be one of code_offload, command, schedule, custom; got %q", in.Kind))
+		if !contains(jobKinds, in.Kind) {
+			return nil, jobResult{}, toolError(ToolJobCreate, fmt.Errorf("kind must be one of %s; got %q", strings.Join(jobKinds, ", "), in.Kind))
 		}
 		if err := checkJSONSize("payload", in.Payload); err != nil {
 			return nil, jobResult{}, err
@@ -357,6 +456,38 @@ func Register(server *mcp.Server, c Syncer, opts ...Option) {
 	})
 }
 
+// stubOversized replaces each message whose own JSON encoding exceeds limit
+// with a stub that keeps its identity but withholds content and refs, and
+// returns the ids of the stubs. Without this a single huge message written by
+// another client would be returned whole, since the first message of a page is
+// always kept so that paging makes progress.
+func stubOversized(msgs []syncclient.Message, limit int) ([]syncclient.Message, []string) {
+	var ids []string
+	var out []syncclient.Message
+	for i, m := range msgs {
+		b, err := json.Marshal(m)
+		if err == nil && len(b) <= limit {
+			if out != nil {
+				out = append(out, m)
+			}
+			continue
+		}
+		if out == nil {
+			out = append(make([]syncclient.Message, 0, len(msgs)), msgs[:i]...)
+		}
+		stub := syncclient.Message{ID: m.ID, ThreadID: m.ThreadID, Role: m.Role, CreatedAt: m.CreatedAt}
+		if len(m.SenderActorID) <= 256 {
+			stub.SenderActorID = m.SenderActorID
+		}
+		out = append(out, stub)
+		ids = append(ids, m.ID)
+	}
+	if out == nil {
+		return msgs, nil
+	}
+	return out, ids
+}
+
 // capListBytes returns the longest prefix of msgs whose JSON encoding totals
 // at most limit bytes, and whether anything was dropped. The first message is
 // always kept so that paging with after_id always makes progress.
@@ -373,6 +504,16 @@ func capListBytes(msgs []syncclient.Message, limit int) ([]syncclient.Message, b
 		}
 	}
 	return msgs, false
+}
+
+// escapedLen is the length of s as the contents of a JSON string (without the
+// quotes), which is how the content is stored, listed and returned.
+func escapedLen(s string) int {
+	b, err := json.Marshal(s)
+	if err != nil {
+		return len(s)
+	}
+	return len(b) - 2
 }
 
 // checkJSONSize rejects a free-form input whose JSON encoding exceeds

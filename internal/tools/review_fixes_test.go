@@ -134,13 +134,13 @@ func TestListHasMoreFlag(t *testing.T) {
 	if three["count"].(float64) != 3 || three["has_more"] != false {
 		t.Errorf("limit 3: %v", three)
 	}
-	// The default limit is 100, and the 101st message is not returned.
-	for i := 0; i < 98; i++ {
+	// The default limit is 20, and the 21st message is not returned.
+	for i := 0; i < 18; i++ {
 		h.ok(t, tools.ToolMessageAppend, map[string]any{"thread_id": "t1", "role": "user", "content": "m"})
 	}
 	exact := h.ok(t, tools.ToolMessageList, map[string]any{"thread_id": "t1"})
-	if exact["count"].(float64) != 100 || exact["has_more"] != true {
-		t.Errorf("101 messages with default limit: count=%v has_more=%v", exact["count"], exact["has_more"])
+	if exact["count"].(float64) != 20 || exact["has_more"] != true {
+		t.Errorf("21 messages with default limit: count=%v has_more=%v", exact["count"], exact["has_more"])
 	}
 }
 
